@@ -1,6 +1,14 @@
 //! Hardware-accelerated crypto implementations using STM32H7 CRYP and HASH peripherals.
 //!
 //! Call [`init`] once at startup before using the hardware cipher suite.
+//!
+//! # Interrupt latency
+//!
+//! All operations run in blocking mode inside a [`critical_section`], which
+//! disables interrupts on single-core Cortex-M. For large payloads (e.g.
+//! 4 KB AES-GCM), interrupts may be disabled for hundreds of microseconds.
+//! If this is unacceptable for your application's real-time requirements,
+//! consider splitting large operations or migrating to async DMA mode.
 
 pub mod cipher;
 pub mod hash;
