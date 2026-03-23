@@ -25,17 +25,24 @@ also be hardware-accelerated.
 - **`HardwareAesGcm128` / `HardwareAesGcm256`** — AES-GCM via CRYP peripheral.
   Processes data block-by-block with a 16-byte temp buffer to work around the
   peripheral's separate input/output buffer requirement. Constant-time tag
-  verification.
+  verification via `subtle::ConstantTimeEq`. Key material zeroed on drop.
 
 - **`HardwareSha256`** — SHA-256 via HASH peripheral. The peripheral's `Context`
   supports Clone (register save/restore), enabling transcript hash snapshots
   as required by TLS 1.3.
 
 - **`HardwareHmacSha256`** — HMAC-SHA-256 via RFC 2104 standard construction on
-  top of hardware SHA-256, avoiding self-referential lifetime issues with the
-  HASH peripheral's native HMAC mode.
+  top of hardware SHA-256. Key material zeroed on drop.
 
 - **`HardwareHkdfSha256`** — HKDF-SHA-256 built entirely on `HardwareHmacSha256`.
+  PRK zeroed on drop.
+
+### Security
+
+- Constant-time tag comparison using `subtle::ConstantTimeEq`
+- Key material zeroed on drop using `zeroize`
+- Double-initialization guard on `hardware::init()`
+- RNG initialization documented as prerequisite for CRYP/HASH
 
 ## Usage
 
@@ -44,26 +51,36 @@ use embassy_stm32::cryp::Cryp;
 use embassy_stm32::hash::Hash;
 use embassy_stm32::rng::Rng;
 use embassy_stm32_tls::{Stm32H7Aes128GcmSha256, Stm32H7CryptoProvider, hardware};
+use embedded_tls::{TlsConfig, TlsConnection, TlsContext, UnsecureProvider};
 
-// Initialize hardware crypto (once, at startup)
+// Initialize hardware crypto (once, at startup — after RNG!)
+let rng = Rng::new(p.RNG, Irqs);
 let cryp = Cryp::new_blocking(p.CRYP, Irqs);
 let hash = Hash::new_blocking(p.HASH, Irqs);
 hardware::init(cryp, hash);
 
-// Create a crypto provider with hardware RNG
-let rng = Rng::new(p.RNG, Irqs);
-let mut provider = Stm32H7CryptoProvider::new(rng);
+// Create provider with hardware cipher suite
+let mut provider = UnsecureProvider::new::<Stm32H7Aes128GcmSha256>(rng);
 
-// Use with embedded-tls (hardware cipher suite instead of software)
-// tls.open::<_, Stm32H7Aes128GcmSha256>(TlsContext::new(&config, &mut provider)).await?;
+// TLS handshake
+let mut tls: TlsConnection<'_, _, Stm32H7Aes128GcmSha256> =
+    TlsConnection::new(socket, &mut read_buf, &mut write_buf);
+tls.open(TlsContext::new(&config, &mut provider)).await.unwrap();
 ```
 
 ## Examples
 
+### TLS handshake (end-to-end test)
+
+Full TLS 1.3 connection to example.com:443 over Ethernet with hardware crypto:
+
+```
+cargo run --example tls_handshake --release --target thumbv7em-none-eabihf
+```
+
 ### Benchmark (hardware vs software)
 
-Measures cycle counts for all crypto operations at multiple payload sizes
-(64, 256, 1024, 4096 bytes) using the DWT cycle counter:
+Measures cycle counts and memory for all crypto operations at 64/256/1024/4096B:
 
 ```
 cargo run --example benchmark --release --target thumbv7em-none-eabihf
@@ -71,20 +88,26 @@ cargo run --example benchmark --release --target thumbv7em-none-eabihf
 
 ### Test vectors
 
-Verifies hardware implementations against NIST test vectors, RFC 4231, and
-byte-for-byte comparison with software implementations:
+~180 tests: NIST KATs, RFC 4231/5869, hw-vs-sw comparison, edge cases,
+negative tests, cross-implementation decrypt, interleaved hash contexts:
 
 ```
 cargo run --example test_vectors --release --target thumbv7em-none-eabihf
 ```
 
-## Dependencies on embedded-tls fork
+## Interrupt latency
+
+All operations run in blocking mode inside critical sections. For large
+payloads (e.g. 4 KB AES-GCM), interrupts may be disabled for hundreds of
+microseconds. See the `hardware` module documentation for details.
+
+## Dependencies
 
 This crate depends on a fork of `embedded-tls` that adds abstraction traits
-(`TlsCipher`, `TlsHash`, `TlsHmac`, `TlsHkdf`, `TlsBuffer`) to
-`TlsCipherSuite`. The fork is at
-[fishloa/embedded-tls](https://github.com/fishloa/embedded-tls/tree/hw-crypto-extensibility)
-and an upstream PR is planned.
+for hardware crypto extensibility. The fork is at
+[fishloa/embedded-tls](https://github.com/fishloa/embedded-tls/tree/hw-crypto-extensibility).
+An upstream PR to [drogue-iot/embedded-tls](https://github.com/drogue-iot/embedded-tls)
+is planned after on-target validation.
 
 ## Target hardware
 

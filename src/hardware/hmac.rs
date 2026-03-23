@@ -71,6 +71,10 @@ impl TlsHmac for HardwareHmacSha256 {
             ctx
         });
 
+        // Zeroize intermediate key material.
+        key_block.zeroize();
+        inner_key_pad.zeroize();
+
         Ok(Self {
             inner_ctx,
             outer_key_pad,
@@ -111,6 +115,7 @@ impl TlsHmac for HardwareHmacSha256 {
         });
 
         outer_key_pad.zeroize();
+        inner_digest.zeroize();
         GenericArray::clone_from_slice(&result)
     }
 

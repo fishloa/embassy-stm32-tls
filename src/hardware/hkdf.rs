@@ -84,6 +84,7 @@ impl TlsHkdf for HardwareHkdfSha256 {
             offset += copy_len;
         }
 
+        t.zeroize();
         Ok(())
     }
 }

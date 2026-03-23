@@ -1,7 +1,5 @@
 //! Hardware AES-GCM ciphers using the STM32H7 CRYP peripheral.
 
-use core::convert::TryInto;
-
 use embassy_stm32::cryp::{AesGcm, Direction};
 use embedded_tls::{TlsBuffer, TlsCipher, TlsError};
 use generic_array::GenericArray;
@@ -132,7 +130,9 @@ macro_rules! impl_hardware_aes_gcm {
                     cryp.finish_blocking::<16, _>(ctx)
                 });
 
-                verify_tag(&computed_tag, &received_tag)
+                let result = verify_tag(&computed_tag, &received_tag);
+                received_tag.zeroize();
+                result
             }
         }
     };
