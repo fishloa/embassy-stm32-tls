@@ -773,6 +773,7 @@ dependencies = [
 [[package]]
 name = "embedded-tls"
 version = "0.19.0"
+source = "git+https://github.com/fishloa/embedded-tls.git?branch=hw-crypto-extensibility#c0591119417c96e392eaa759e8bbef6f7b94f2f8"
 dependencies = [
  "aes-gcm",
  "defmt 1.0.1",

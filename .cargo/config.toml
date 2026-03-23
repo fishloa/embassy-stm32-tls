@@ -3,6 +3,3 @@ runner = "probe-rs run --chip STM32H755ZITx"
 
 [build]
 target = "thumbv7em-none-eabihf"
-
-[patch.'https://github.com/fishloa/embedded-tls.git']
-embedded-tls = { path = "../embedded-tls-hw" }
