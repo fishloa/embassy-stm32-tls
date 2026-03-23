@@ -14,12 +14,12 @@ use embassy_stm32::cryp::{self, Cryp};
 use embassy_stm32::hash::{self, Hash};
 use embassy_stm32::rng::Rng;
 use embassy_stm32::{bind_interrupts, peripherals, rng};
-use embedded_tls::{SoftwareCipher, SoftwareHash, SoftwareHkdf, SoftwareHmac, TlsError};
+use embedded_tls::{SoftwareCipher, SoftwareHash, SoftwareHkdf, SoftwareHmac};
 use embedded_tls::{TlsBuffer, TlsCipher, TlsHash, TlsHkdf, TlsHmac};
 use generic_array::GenericArray;
 use {defmt_rtt as _, panic_probe as _};
 
-use embassy_stm32_tls::hardware;
+use embassy_stm32_tls::{TestBuffer, hardware};
 use embassy_stm32_tls::hardware::cipher::HardwareAesGcm128;
 use embassy_stm32_tls::hardware::hash::HardwareSha256;
 use embassy_stm32_tls::hardware::hkdf::HardwareHkdfSha256;
@@ -32,50 +32,6 @@ bind_interrupts!(struct Irqs {
 });
 
 static SHARED: MaybeUninit<embassy_stm32::SharedData> = MaybeUninit::uninit();
-
-struct BenchBuffer {
-    data: [u8; 1024],
-    len: usize,
-}
-
-impl BenchBuffer {
-    fn new(initial: &[u8]) -> Self {
-        let mut buf = Self {
-            data: [0u8; 1024],
-            len: initial.len(),
-        };
-        buf.data[..initial.len()].copy_from_slice(initial);
-        buf
-    }
-}
-
-impl TlsBuffer for BenchBuffer {
-    fn as_slice(&self) -> &[u8] {
-        &self.data[..self.len]
-    }
-    fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.data[..self.len]
-    }
-    fn len(&self) -> usize {
-        self.len
-    }
-    fn extend_from_slice(&mut self, other: &[u8]) -> Result<(), TlsError> {
-        if self.len + other.len() > self.data.len() {
-            return Err(TlsError::EncodeError);
-        }
-        self.data[self.len..self.len + other.len()].copy_from_slice(other);
-        self.len += other.len();
-        Ok(())
-    }
-    fn truncate(&mut self, len: usize) {
-        if len < self.len {
-            self.len = len;
-        }
-    }
-    fn capacity(&self) -> usize {
-        self.data.len()
-    }
-}
 
 /// Compare two byte slices; return true if equal. Log first mismatch via defmt on failure.
 fn slices_eq(a: &[u8], b: &[u8], label: &str) -> bool {
@@ -200,7 +156,7 @@ async fn main(_spawner: Spawner) {
         let expected_tag = hex!("58e2fccefa7e3061367f1d57a4e7455a");
 
         let cipher = HardwareAesGcm128::new(&key);
-        let mut buf = BenchBuffer::new(&[]);
+        let mut buf = TestBuffer::<1024>::new(&[]);
         cipher.encrypt_in_place(&nonce, &[], &mut buf).unwrap();
         // Buffer now contains just the 16-byte tag
         check!(slices_eq(buf.as_slice(), &expected_tag, "gcm-zero"), "AES-GCM empty plaintext");
@@ -215,7 +171,7 @@ async fn main(_spawner: Spawner) {
         let expected_ct = hex!("42831ec2217774244b7221b784d0d49c");
 
         let cipher = HardwareAesGcm128::new(&key);
-        let mut buf = BenchBuffer::new(&plaintext);
+        let mut buf = TestBuffer::<1024>::new(&plaintext);
         cipher.encrypt_in_place(&nonce, &[], &mut buf).unwrap();
         // First 16 bytes are ciphertext, last 16 are tag
         let ok_ct = slices_eq(&buf.as_slice()[..16], &expected_ct, "gcm-nist-ct");
@@ -223,7 +179,7 @@ async fn main(_spawner: Spawner) {
 
         // Verify tag matches software implementation
         let sw_cipher = <SoftwareCipher<aes_gcm::Aes128Gcm>>::new(&key);
-        let mut sw_buf = BenchBuffer::new(&plaintext);
+        let mut sw_buf = TestBuffer::<1024>::new(&plaintext);
         sw_cipher.encrypt_in_place(&nonce, &[], &mut sw_buf).unwrap();
         let ok_tag = slices_eq(&buf.as_slice()[16..], &sw_buf.as_slice()[16..], "gcm-nist-tag");
         check!(ok_tag, "AES-GCM NIST tag hw==sw");
@@ -281,11 +237,11 @@ async fn main(_spawner: Spawner) {
         let data = [0x42u8; 256];
 
         let hw_cipher = HardwareAesGcm128::new(&key);
-        let mut hw_buf = BenchBuffer::new(&data);
+        let mut hw_buf = TestBuffer::<1024>::new(&data);
         hw_cipher.encrypt_in_place(&nonce, &aad, &mut hw_buf).unwrap();
 
         let sw_cipher = <SoftwareCipher<aes_gcm::Aes128Gcm>>::new(&key);
-        let mut sw_buf = BenchBuffer::new(&data);
+        let mut sw_buf = TestBuffer::<1024>::new(&data);
         sw_cipher.encrypt_in_place(&nonce, &aad, &mut sw_buf).unwrap();
 
         check!(
@@ -314,7 +270,7 @@ async fn main(_spawner: Spawner) {
             }
 
             let cipher = HardwareAesGcm128::new(&key);
-            let mut buf = BenchBuffer::new(&plaintext[..sz]);
+            let mut buf = TestBuffer::<1024>::new(&plaintext[..sz]);
             cipher.encrypt_in_place(&nonce, aad, &mut buf).unwrap();
 
             // buf now has ciphertext + 16-byte tag

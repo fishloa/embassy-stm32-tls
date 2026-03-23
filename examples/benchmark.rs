@@ -18,11 +18,11 @@ use embassy_stm32::hash::{self, Hash};
 use embassy_stm32::rng::Rng;
 use embassy_stm32::{bind_interrupts, peripherals, rng};
 use embedded_tls::{TlsBuffer, TlsCipher, TlsHash, TlsHkdf, TlsHmac};
-use embedded_tls::{SoftwareCipher, SoftwareHash, SoftwareHkdf, SoftwareHmac, TlsError};
+use embedded_tls::{SoftwareCipher, SoftwareHash, SoftwareHkdf, SoftwareHmac};
 use generic_array::GenericArray;
 use {defmt_rtt as _, panic_probe as _};
 
-use embassy_stm32_tls::hardware;
+use embassy_stm32_tls::{TestBuffer, hardware};
 use embassy_stm32_tls::hardware::cipher::HardwareAesGcm128;
 use embassy_stm32_tls::hardware::hash::HardwareSha256;
 use embassy_stm32_tls::hardware::hkdf::HardwareHkdfSha256;
@@ -35,56 +35,6 @@ bind_interrupts!(struct Irqs {
 });
 
 static SHARED: MaybeUninit<embassy_stm32::SharedData> = MaybeUninit::uninit();
-
-/// A simple stack-allocated buffer implementing `TlsBuffer` for benchmarking.
-struct BenchBuffer {
-    data: [u8; 1024],
-    len: usize,
-}
-
-impl BenchBuffer {
-    fn new(initial: &[u8]) -> Self {
-        let mut buf = Self {
-            data: [0u8; 1024],
-            len: initial.len(),
-        };
-        buf.data[..initial.len()].copy_from_slice(initial);
-        buf
-    }
-}
-
-impl TlsBuffer for BenchBuffer {
-    fn as_slice(&self) -> &[u8] {
-        &self.data[..self.len]
-    }
-
-    fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.data[..self.len]
-    }
-
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    fn extend_from_slice(&mut self, other: &[u8]) -> Result<(), TlsError> {
-        if self.len + other.len() > self.data.len() {
-            return Err(TlsError::EncodeError);
-        }
-        self.data[self.len..self.len + other.len()].copy_from_slice(other);
-        self.len += other.len();
-        Ok(())
-    }
-
-    fn truncate(&mut self, len: usize) {
-        if len < self.len {
-            self.len = len;
-        }
-    }
-
-    fn capacity(&self) -> usize {
-        self.data.len()
-    }
-}
 
 /// Read the DWT cycle counter.
 #[inline(always)]
@@ -214,7 +164,7 @@ async fn main(_spawner: Spawner) {
     let t0 = cycles();
     {
         let cipher = HardwareAesGcm128::new(&aes_key);
-        let mut buf = BenchBuffer::new(&test_data);
+        let mut buf = TestBuffer::<1024>::new(&test_data);
         cipher.encrypt_in_place(&aes_nonce, &aad, &mut buf).unwrap();
     }
     let hw_aes = cycles().wrapping_sub(t0);
@@ -224,7 +174,7 @@ async fn main(_spawner: Spawner) {
     let t0 = cycles();
     {
         let cipher = <SoftwareCipher<aes_gcm::Aes128Gcm>>::new(&aes_key);
-        let mut buf = BenchBuffer::new(&test_data);
+        let mut buf = TestBuffer::<1024>::new(&test_data);
         cipher.encrypt_in_place(&aes_nonce, &aad, &mut buf).unwrap();
     }
     let sw_aes = cycles().wrapping_sub(t0);
@@ -238,7 +188,7 @@ async fn main(_spawner: Spawner) {
     info!("--- AES-128-GCM encrypt+decrypt round-trip ---");
     {
         let cipher = HardwareAesGcm128::new(&aes_key);
-        let mut buf = BenchBuffer::new(&test_data);
+        let mut buf = TestBuffer::<1024>::new(&test_data);
         cipher.encrypt_in_place(&aes_nonce, &aad, &mut buf).unwrap();
         cipher.decrypt_in_place(&aes_nonce, &aad, &mut buf).unwrap();
         defmt::assert_eq!(&buf.as_slice()[..test_data.len()], &test_data[..]);
