@@ -544,18 +544,24 @@ dependencies = [
 name = "embassy-stm32-tls"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "cortex-m",
  "cortex-m-rt",
+ "critical-section",
  "defmt 0.3.100",
  "defmt-rtt",
+ "digest",
  "embassy-executor",
  "embassy-net",
  "embassy-stm32",
  "embassy-time 0.4.0",
  "embedded-io-async 0.7.0",
  "embedded-tls",
+ "generic-array 0.14.7",
  "panic-probe",
+ "sha2",
  "static_cell",
+ "typenum",
 ]
 
 [[package]]

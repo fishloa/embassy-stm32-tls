@@ -12,6 +12,10 @@ categories = ["embedded", "no-std", "cryptography"]
 [dependencies]
 embassy-stm32 = { version = "0.6", features = ["stm32h755zi-cm7"] }
 embedded-tls = { path = "../embedded-tls-hw", default-features = false }
+critical-section = "1"
+digest = { version = "0.10", default-features = false }
+generic-array = { version = "0.14", default-features = false }
+typenum = { version = "1", default-features = false }
 defmt = { version = "0.3", optional = true }
 
 [features]
@@ -29,6 +33,9 @@ cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
 cortex-m-rt = "0.7"
 static_cell = "2"
 panic-probe = { version = "0.3", features = ["print-defmt"] }
+sha2 = { version = "0.10", default-features = false }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
+generic-array = { version = "0.14", default-features = false }
 
 [profile.release]
 opt-level = "z"
