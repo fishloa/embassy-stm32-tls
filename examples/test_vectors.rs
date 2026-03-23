@@ -1,8 +1,3 @@
-//! On-target test: verify hardware crypto against known test vectors and
-//! software implementations on NUCLEO-H755ZI-Q.
-//!
-//! Run with: cargo run --example test_vectors --release --target thumbv7em-none-eabihf
-
 #![no_std]
 #![no_main]
 
@@ -19,11 +14,11 @@ use embedded_tls::{TlsBuffer, TlsCipher, TlsHash, TlsHkdf, TlsHmac};
 use generic_array::GenericArray;
 use {defmt_rtt as _, panic_probe as _};
 
-use embassy_stm32_tls::{TestBuffer, hardware};
-use embassy_stm32_tls::hardware::cipher::HardwareAesGcm128;
+use embassy_stm32_tls::hardware::cipher::{HardwareAesGcm128, HardwareAesGcm256};
 use embassy_stm32_tls::hardware::hash::HardwareSha256;
 use embassy_stm32_tls::hardware::hkdf::HardwareHkdfSha256;
 use embassy_stm32_tls::hardware::hmac::HardwareHmacSha256;
+use embassy_stm32_tls::{hardware, TestBuffer};
 
 bind_interrupts!(struct Irqs {
     HASH_RNG => rng::InterruptHandler<peripherals::RNG>,
@@ -33,7 +28,6 @@ bind_interrupts!(struct Irqs {
 
 static SHARED: MaybeUninit<embassy_stm32::SharedData> = MaybeUninit::uninit();
 
-/// Compare two byte slices; return true if equal. Log first mismatch via defmt on failure.
 fn slices_eq(a: &[u8], b: &[u8], label: &str) -> bool {
     if a.len() != b.len() {
         error!("{}: length mismatch: {} vs {}", label, a.len(), b.len());
@@ -48,7 +42,6 @@ fn slices_eq(a: &[u8], b: &[u8], label: &str) -> bool {
     true
 }
 
-/// Decode a compile-time hex string into a byte array.
 macro_rules! hex {
     ($hex:expr) => {{
         const LEN: usize = $hex.len() / 2;
@@ -78,6 +71,12 @@ macro_rules! hex {
     }};
 }
 
+fn fill_pattern(buf: &mut [u8]) {
+    for i in 0..buf.len() {
+        buf[i] = i as u8;
+    }
+}
+
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     let p = embassy_stm32::init_primary(Default::default(), &SHARED);
@@ -102,212 +101,492 @@ async fn main(_spawner: Spawner) {
         };
     }
 
-    // ===================================================================
-    // 1. SHA-256 Known Answer Tests
-    // ===================================================================
-    info!("=== 1. SHA-256 Known Answer Tests ===");
+    // =================================================================
+    // 1. SHA-256 KATs (NIST FIPS 180-4)
+    // =================================================================
+    info!("=== 1. SHA-256 KATs ===");
     {
-        // Empty string
         let expected = hex!("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
         let mut h = HardwareSha256::new();
         h.update(&[]);
-        let digest = h.finalize();
-        check!(slices_eq(digest.as_slice(), &expected, "sha256-empty"), "SHA-256 empty");
+        check!(slices_eq(h.finalize().as_slice(), &expected, "sha256"), "SHA-256 empty");
     }
     {
-        // "abc"
         let expected = hex!("ba7816bf8f01cfea414140de5dae2223b6ee7ad5cb3b039a9ef2c05e5b17b9a8");
         let mut h = HardwareSha256::new();
         h.update(b"abc");
-        let digest = h.finalize();
-        check!(slices_eq(digest.as_slice(), &expected, "sha256-abc"), "SHA-256 \"abc\"");
+        check!(slices_eq(h.finalize().as_slice(), &expected, "sha256"), "SHA-256 \"abc\"");
     }
     {
-        // "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
         let expected = hex!("248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
         let mut h = HardwareSha256::new();
         h.update(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq");
-        let digest = h.finalize();
-        check!(slices_eq(digest.as_slice(), &expected, "sha256-long"), "SHA-256 448-bit msg");
-    }
-
-    // ===================================================================
-    // 2. HMAC-SHA-256 Known Answer Test (RFC 4231 Test Case 1)
-    // ===================================================================
-    info!("=== 2. HMAC-SHA-256 Known Answer Test ===");
-    {
-        let key = [0x0bu8; 20];
-        let data = b"Hi There";
-        let expected = hex!("b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
-        let mut hmac = HardwareHmacSha256::new_from_slice(&key).unwrap();
-        hmac.update(data);
-        let tag = hmac.finalize();
-        check!(slices_eq(tag.as_slice(), &expected, "hmac-rfc4231"), "HMAC-SHA-256 RFC 4231 TC1");
-    }
-
-    // ===================================================================
-    // 3. AES-128-GCM Known Answer Tests
-    // ===================================================================
-    info!("=== 3. AES-128-GCM Known Answer Tests ===");
-    {
-        // NIST vector: all-zero key/IV, empty plaintext
-        let key: GenericArray<u8, typenum::U16> = GenericArray::clone_from_slice(&[0u8; 16]);
-        let nonce: GenericArray<u8, typenum::U12> = GenericArray::clone_from_slice(&[0u8; 12]);
-        let expected_tag = hex!("58e2fccefa7e3061367f1d57a4e7455a");
-
-        let cipher = HardwareAesGcm128::new(&key);
-        let mut buf = TestBuffer::<1024>::new(&[]);
-        cipher.encrypt_in_place(&nonce, &[], &mut buf).unwrap();
-        // Buffer now contains just the 16-byte tag
-        check!(slices_eq(buf.as_slice(), &expected_tag, "gcm-zero"), "AES-GCM empty plaintext");
+        check!(slices_eq(h.finalize().as_slice(), &expected, "sha256"), "SHA-256 448-bit");
     }
     {
-        // NIST vector with data: first 16 bytes of the standard test
-        let key_bytes = hex!("feffe9928665731c6d6a8f9467308308");
-        let key: GenericArray<u8, typenum::U16> = GenericArray::clone_from_slice(&key_bytes);
-        let nonce_bytes = hex!("cafebabefacedbaddecaf888");
-        let nonce: GenericArray<u8, typenum::U12> = GenericArray::clone_from_slice(&nonce_bytes);
-        let plaintext = hex!("d9313225f88406e5a55909c5aff5269a");
-        let expected_ct = hex!("42831ec2217774244b7221b784d0d49c");
-
-        let cipher = HardwareAesGcm128::new(&key);
-        let mut buf = TestBuffer::<1024>::new(&plaintext);
-        cipher.encrypt_in_place(&nonce, &[], &mut buf).unwrap();
-        // First 16 bytes are ciphertext, last 16 are tag
-        let ok_ct = slices_eq(&buf.as_slice()[..16], &expected_ct, "gcm-nist-ct");
-        check!(ok_ct, "AES-GCM NIST ciphertext");
-
-        // Verify tag matches software implementation
-        let sw_cipher = <SoftwareCipher<aes_gcm::Aes128Gcm>>::new(&key);
-        let mut sw_buf = TestBuffer::<1024>::new(&plaintext);
-        sw_cipher.encrypt_in_place(&nonce, &[], &mut sw_buf).unwrap();
-        let ok_tag = slices_eq(&buf.as_slice()[16..], &sw_buf.as_slice()[16..], "gcm-nist-tag");
-        check!(ok_tag, "AES-GCM NIST tag hw==sw");
-    }
-
-    // ===================================================================
-    // 4. Hardware vs Software Comparison
-    // ===================================================================
-    info!("=== 4. Hardware vs Software Comparison ===");
-    {
-        // SHA-256: 512 bytes of 0xAA
-        let data = [0xAAu8; 512];
-        let mut hw = HardwareSha256::new();
-        hw.update(&data);
-        let hw_dig = hw.finalize();
-        let mut sw = <SoftwareHash<sha2::Sha256>>::new();
-        sw.update(&data);
-        let sw_dig = sw.finalize();
-        check!(slices_eq(hw_dig.as_slice(), sw_dig.as_slice(), "sha256-cmp"), "SHA-256 hw==sw 512B");
+        let expected = hex!("cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1");
+        let mut h = HardwareSha256::new();
+        h.update(b"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu");
+        check!(slices_eq(h.finalize().as_slice(), &expected, "sha256"), "SHA-256 896-bit");
     }
     {
-        // HMAC-SHA-256: 32-byte key, 128-byte message
-        let key = [0x55u8; 32];
-        let msg = [0x77u8; 128];
-        let mut hw = HardwareHmacSha256::new_from_slice(&key).unwrap();
-        hw.update(&msg);
-        let hw_tag = hw.finalize();
-        let mut sw = <SoftwareHmac<sha2::Sha256>>::new_from_slice(&key).unwrap();
-        sw.update(&msg);
-        let sw_tag = sw.finalize();
-        check!(slices_eq(hw_tag.as_slice(), sw_tag.as_slice(), "hmac-cmp"), "HMAC hw==sw");
+        // Multi-update: "abc" split across 3 calls
+        let expected = hex!("ba7816bf8f01cfea414140de5dae2223b6ee7ad5cb3b039a9ef2c05e5b17b9a8");
+        let mut h = HardwareSha256::new();
+        h.update(b"a");
+        h.update(b"b");
+        h.update(b"c");
+        check!(slices_eq(h.finalize().as_slice(), &expected, "sha256"), "SHA-256 multi-update");
     }
+
+    // =================================================================
+    // 2. SHA-256 Clone test
+    // =================================================================
+    info!("=== 2. SHA-256 Clone ===");
     {
-        // HKDF: extract + expand to 48 bytes
-        let salt = [0x02u8; 32];
-        let ikm = [0x03u8; 32];
-        let info = [0x04u8; 32];
+        let mut h1 = HardwareSha256::new();
+        h1.update(b"Hello");
+        let h2 = h1.clone();
 
-        let (hw_prk, hw_hkdf) = HardwareHkdfSha256::extract(Some(&salt), &ikm);
-        let mut hw_out = [0u8; 48];
-        hw_hkdf.expand(&info, &mut hw_out).unwrap();
+        let mut h1b = h1;
+        h1b.update(b" World");
+        let dig1 = h1b.finalize();
 
-        let (sw_prk, sw_hkdf) = <SoftwareHkdf<sha2::Sha256>>::extract(Some(&salt), &ikm);
-        let mut sw_out = [0u8; 48];
-        sw_hkdf.expand(&info, &mut sw_out).unwrap();
+        let mut h2b = h2;
+        h2b.update(b" Rust");
+        let dig2 = h2b.finalize();
 
-        check!(slices_eq(hw_prk.as_slice(), sw_prk.as_slice(), "hkdf-prk"), "HKDF PRK hw==sw");
-        check!(slices_eq(&hw_out, &sw_out, "hkdf-expand"), "HKDF expand hw==sw");
+        let mut sw1 = <SoftwareHash<sha2::Sha256>>::new();
+        sw1.update(b"Hello World");
+        let sw_dig1 = sw1.finalize();
+
+        let mut sw2 = <SoftwareHash<sha2::Sha256>>::new();
+        sw2.update(b"Hello Rust");
+        let sw_dig2 = sw2.finalize();
+
+        check!(slices_eq(dig1.as_slice(), sw_dig1.as_slice(), "clone"), "SHA-256 clone orig");
+        check!(slices_eq(dig2.as_slice(), sw_dig2.as_slice(), "clone"), "SHA-256 clone fork");
     }
+
+    // =================================================================
+    // 3. SHA-256 hw-vs-sw at multiple sizes
+    // =================================================================
+    info!("=== 3. SHA-256 hw-vs-sw ===");
     {
-        // AES-128-GCM: encrypt 256 bytes, compare ciphertext+tag
-        let key: GenericArray<u8, typenum::U16> = GenericArray::clone_from_slice(&[0xABu8; 16]);
-        let nonce: GenericArray<u8, typenum::U12> = GenericArray::clone_from_slice(&[0xCDu8; 12]);
-        let aad = [0xEFu8; 13];
-        let data = [0x42u8; 256];
-
-        let hw_cipher = HardwareAesGcm128::new(&key);
-        let mut hw_buf = TestBuffer::<1024>::new(&data);
-        hw_cipher.encrypt_in_place(&nonce, &aad, &mut hw_buf).unwrap();
-
-        let sw_cipher = <SoftwareCipher<aes_gcm::Aes128Gcm>>::new(&key);
-        let mut sw_buf = TestBuffer::<1024>::new(&data);
-        sw_cipher.encrypt_in_place(&nonce, &aad, &mut sw_buf).unwrap();
-
-        check!(
-            slices_eq(hw_buf.as_slice(), sw_buf.as_slice(), "aes-cmp"),
-            "AES-GCM encrypt hw==sw 256B"
-        );
-    }
-
-    // ===================================================================
-    // 5. AES-128-GCM Edge Cases: encrypt/decrypt round-trip
-    // ===================================================================
-    info!("=== 5. AES-128-GCM Edge Cases ===");
-    let key: GenericArray<u8, typenum::U16> = GenericArray::clone_from_slice(&[0x11u8; 16]);
-    let nonce: GenericArray<u8, typenum::U12> = GenericArray::clone_from_slice(&[0x22u8; 12]);
-    let aad_data = [0x33u8; 17];
-    let sizes: [usize; 9] = [0, 1, 15, 16, 17, 31, 32, 256, 0 /* placeholder for re-use */];
-    // We test sizes[0..8] without AAD, then sizes[0..8] with AAD.
-
-    for pass in 0..2u8 {
-        let aad: &[u8] = if pass == 0 { &[] } else { &aad_data };
-        for &sz in &sizes[..8] {
-            // Build plaintext
-            let mut plaintext = [0u8; 256];
-            for i in 0..sz {
-                plaintext[i] = i as u8;
-            }
-
-            let cipher = HardwareAesGcm128::new(&key);
-            let mut buf = TestBuffer::<1024>::new(&plaintext[..sz]);
-            cipher.encrypt_in_place(&nonce, aad, &mut buf).unwrap();
-
-            // buf now has ciphertext + 16-byte tag
-            if buf.len() != sz + 16 {
-                error!("size {}: enc output len {} expected {}", sz, buf.len(), sz + 16);
-                failed += 1;
-                continue;
-            }
-
-            cipher.decrypt_in_place(&nonce, aad, &mut buf).unwrap();
-
-            let ok = slices_eq(buf.as_slice(), &plaintext[..sz], "aes-rt");
-            check!(ok, match (sz, pass) {
-                (0, 0) => "RT 0B no-aad",
-                (1, 0) => "RT 1B no-aad",
-                (15, 0) => "RT 15B no-aad",
-                (16, 0) => "RT 16B no-aad",
-                (17, 0) => "RT 17B no-aad",
-                (31, 0) => "RT 31B no-aad",
-                (32, 0) => "RT 32B no-aad",
-                (256, 0) => "RT 256B no-aad",
-                (0, _) => "RT 0B with-aad",
-                (1, _) => "RT 1B with-aad",
-                (15, _) => "RT 15B with-aad",
-                (16, _) => "RT 16B with-aad",
-                (17, _) => "RT 17B with-aad",
-                (31, _) => "RT 31B with-aad",
-                (32, _) => "RT 32B with-aad",
-                (256, _) => "RT 256B with-aad",
-                _ => "RT unknown",
+        let sizes: [usize; 6] = [1, 55, 56, 64, 128, 1024];
+        let mut data = [0xAAu8; 1024];
+        fill_pattern(&mut data);
+        for &sz in &sizes {
+            let mut hw = HardwareSha256::new();
+            hw.update(&data[..sz]);
+            let hw_dig = hw.finalize();
+            let mut sw = <SoftwareHash<sha2::Sha256>>::new();
+            sw.update(&data[..sz]);
+            let sw_dig = sw.finalize();
+            check!(slices_eq(hw_dig.as_slice(), sw_dig.as_slice(), "sha256-cmp"), match sz {
+                1 => "SHA-256 hw==sw 1B",
+                55 => "SHA-256 hw==sw 55B",
+                56 => "SHA-256 hw==sw 56B",
+                64 => "SHA-256 hw==sw 64B",
+                128 => "SHA-256 hw==sw 128B",
+                1024 => "SHA-256 hw==sw 1024B",
+                _ => "SHA-256 hw==sw ?",
             });
         }
     }
 
-    // ===================================================================
+    // =================================================================
+    // 4. HMAC-SHA-256 KATs (RFC 4231)
+    // =================================================================
+    info!("=== 4. HMAC-SHA-256 KATs ===");
+    {
+        // TC1
+        let key = [0x0bu8; 20];
+        let expected = hex!("b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
+        let mut hmac = HardwareHmacSha256::new_from_slice(&key).unwrap();
+        hmac.update(b"Hi There");
+        check!(slices_eq(hmac.finalize().as_slice(), &expected, "hmac"), "HMAC TC1");
+    }
+    {
+        // TC2
+        let expected = hex!("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+        let mut hmac = HardwareHmacSha256::new_from_slice(b"Jefe").unwrap();
+        hmac.update(b"what do ya want for nothing?");
+        check!(slices_eq(hmac.finalize().as_slice(), &expected, "hmac"), "HMAC TC2");
+    }
+    {
+        // TC3
+        let key = [0xAAu8; 20];
+        let data = [0xDDu8; 50];
+        let expected = hex!("773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe");
+        let mut hmac = HardwareHmacSha256::new_from_slice(&key).unwrap();
+        hmac.update(&data);
+        check!(slices_eq(hmac.finalize().as_slice(), &expected, "hmac"), "HMAC TC3");
+    }
+    {
+        // TC6: key longer than block size
+        let key = [0xAAu8; 131];
+        let expected = hex!("60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54");
+        let mut hmac = HardwareHmacSha256::new_from_slice(&key).unwrap();
+        hmac.update(b"Test Using Larger Than Block-Size Key - Hash Key First");
+        check!(slices_eq(hmac.finalize().as_slice(), &expected, "hmac"), "HMAC TC6");
+    }
+    {
+        // TC7: key and data longer than block size
+        let key = [0xAAu8; 131];
+        let expected = hex!("9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2");
+        let mut hmac = HardwareHmacSha256::new_from_slice(&key).unwrap();
+        hmac.update(b"This is a test using a larger than block-size key and a larger than block-size data. The key needs to be hashed before being used by the HMAC algorithm.");
+        check!(slices_eq(hmac.finalize().as_slice(), &expected, "hmac"), "HMAC TC7");
+    }
+
+    // =================================================================
+    // 5. HMAC-SHA-256 hw-vs-sw
+    // =================================================================
+    info!("=== 5. HMAC-SHA-256 hw-vs-sw ===");
+    {
+        let key_sizes: [usize; 4] = [16, 32, 64, 128];
+        let data_sizes: [usize; 6] = [0, 1, 63, 64, 65, 256];
+        let mut key_buf = [0x55u8; 128];
+        fill_pattern(&mut key_buf);
+        let mut data_buf = [0x77u8; 256];
+        fill_pattern(&mut data_buf);
+        for &ks in &key_sizes {
+            for &ds in &data_sizes {
+                let mut hw = HardwareHmacSha256::new_from_slice(&key_buf[..ks]).unwrap();
+                hw.update(&data_buf[..ds]);
+                let hw_tag = hw.finalize();
+                let mut sw = <SoftwareHmac<sha2::Sha256>>::new_from_slice(&key_buf[..ks]).unwrap();
+                sw.update(&data_buf[..ds]);
+                let sw_tag = sw.finalize();
+                check!(slices_eq(hw_tag.as_slice(), sw_tag.as_slice(), "hmac-cmp"),
+                    "HMAC hw==sw k/d");
+            }
+        }
+    }
+
+    // =================================================================
+    // 6. HMAC verify() test
+    // =================================================================
+    info!("=== 6. HMAC verify() ===");
+    {
+        let key = [0x42u8; 32];
+        let data = b"test message for verify";
+
+        // Compute tag
+        let mut hmac = HardwareHmacSha256::new_from_slice(&key).unwrap();
+        hmac.update(data);
+        let tag = hmac.finalize();
+
+        // Verify correct tag
+        let mut hmac2 = HardwareHmacSha256::new_from_slice(&key).unwrap();
+        hmac2.update(data);
+        let ok = hmac2.verify(&tag).is_ok();
+        check!(ok, "HMAC verify correct");
+
+        // Verify tampered tag
+        let mut bad_tag = GenericArray::clone_from_slice(tag.as_slice());
+        bad_tag[0] ^= 1;
+        let mut hmac3 = HardwareHmacSha256::new_from_slice(&key).unwrap();
+        hmac3.update(data);
+        let ok = hmac3.verify(&bad_tag).is_err();
+        check!(ok, "HMAC verify tampered");
+    }
+
+    // =================================================================
+    // 7. HKDF-SHA-256 KATs (RFC 5869)
+    // =================================================================
+    info!("=== 7. HKDF-SHA-256 KATs ===");
+    {
+        // TC1
+        let ikm = hex!("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b");
+        let salt = hex!("000102030405060708090a0b0c");
+        let info = hex!("f0f1f2f3f4f5f6f7f8f9");
+        let expected_prk = hex!("077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5");
+        let expected_okm = hex!("3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865");
+
+        let (prk, hkdf) = HardwareHkdfSha256::extract(Some(&salt), &ikm);
+        check!(slices_eq(prk.as_slice(), &expected_prk, "hkdf-prk"), "HKDF TC1 PRK");
+        let mut okm = [0u8; 42];
+        hkdf.expand(&info, &mut okm).unwrap();
+        check!(slices_eq(&okm, &expected_okm, "hkdf-okm"), "HKDF TC1 OKM");
+    }
+    {
+        // TC2
+        let ikm = hex!("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f");
+        let salt = hex!("606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf");
+        let info = hex!("b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff");
+        let expected_prk = hex!("06a6b88c5853361a06104c9ceb35b45cef760014904671014a193f40c15fc244");
+        let expected_okm = hex!("b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c59045a99cac7827271cb41c65e590e09da3275600c2f09b8367793a9aca3db71cc30c58179ec3e87c14c01d5c1f3434f1d87");
+
+        let (prk, hkdf) = HardwareHkdfSha256::extract(Some(&salt), &ikm);
+        check!(slices_eq(prk.as_slice(), &expected_prk, "hkdf-prk"), "HKDF TC2 PRK");
+        let mut okm = [0u8; 82];
+        hkdf.expand(&info, &mut okm).unwrap();
+        check!(slices_eq(&okm, &expected_okm, "hkdf-okm"), "HKDF TC2 OKM");
+    }
+    {
+        // TC3: no salt, no info
+        let ikm = hex!("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b");
+        let expected_prk = hex!("19ef24a32c717b167f33a91d6f648bdf96596776afdb6377ac434c1c293ccb04");
+        let expected_okm = hex!("8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8");
+
+        let (prk, hkdf) = HardwareHkdfSha256::extract(None, &ikm);
+        check!(slices_eq(prk.as_slice(), &expected_prk, "hkdf-prk"), "HKDF TC3 PRK");
+        let mut okm = [0u8; 42];
+        hkdf.expand(&[], &mut okm).unwrap();
+        check!(slices_eq(&okm, &expected_okm, "hkdf-okm"), "HKDF TC3 OKM");
+    }
+
+    // =================================================================
+    // 8. HKDF hw-vs-sw
+    // =================================================================
+    info!("=== 8. HKDF hw-vs-sw ===");
+    {
+        let salt = [0x02u8; 32];
+        let ikm = [0x03u8; 32];
+        let info = [0x04u8; 32];
+        let expand_sizes: [usize; 6] = [1, 16, 32, 48, 64, 128];
+        for &sz in &expand_sizes {
+            let (hw_prk, hw_hkdf) = HardwareHkdfSha256::extract(Some(&salt), &ikm);
+            let mut hw_out = [0u8; 128];
+            hw_hkdf.expand(&info, &mut hw_out[..sz]).unwrap();
+
+            let (sw_prk, sw_hkdf) = <SoftwareHkdf<sha2::Sha256>>::extract(Some(&salt), &ikm);
+            let mut sw_out = [0u8; 128];
+            sw_hkdf.expand(&info, &mut sw_out[..sz]).unwrap();
+
+            check!(slices_eq(hw_prk.as_slice(), sw_prk.as_slice(), "hkdf"), "HKDF PRK hw==sw");
+            check!(slices_eq(&hw_out[..sz], &sw_out[..sz], "hkdf"), "HKDF expand hw==sw");
+        }
+    }
+
+    // =================================================================
+    // 9. AES-128-GCM KATs
+    // =================================================================
+    info!("=== 9. AES-128-GCM KATs ===");
+    {
+        // All-zero key/IV, empty plaintext
+        let key: GenericArray<u8, typenum::U16> = GenericArray::clone_from_slice(&[0u8; 16]);
+        let nonce: GenericArray<u8, typenum::U12> = GenericArray::clone_from_slice(&[0u8; 12]);
+        let expected_tag = hex!("58e2fccefa7e3061367f1d57a4e7455a");
+        let cipher = HardwareAesGcm128::new(&key);
+        let mut buf = TestBuffer::<1024>::new(&[]);
+        cipher.encrypt_in_place(&nonce, &[], &mut buf).unwrap();
+        check!(slices_eq(buf.as_slice(), &expected_tag, "gcm"), "AES-128-GCM empty KAT");
+    }
+    {
+        // NIST vector with data (first 16 bytes)
+        let key: GenericArray<u8, typenum::U16> = GenericArray::clone_from_slice(&hex!("feffe9928665731c6d6a8f9467308308"));
+        let nonce: GenericArray<u8, typenum::U12> = GenericArray::clone_from_slice(&hex!("cafebabefacedbaddecaf888"));
+        let pt = hex!("d9313225f88406e5a55909c5aff5269a");
+        let expected_ct = hex!("42831ec2217774244b7221b784d0d49c");
+
+        let cipher = HardwareAesGcm128::new(&key);
+        let mut buf = TestBuffer::<1024>::new(&pt);
+        cipher.encrypt_in_place(&nonce, &[], &mut buf).unwrap();
+        check!(slices_eq(&buf.as_slice()[..16], &expected_ct, "gcm-ct"), "AES-128-GCM NIST ct");
+
+        // Compare tag with software
+        let sw = <SoftwareCipher<aes_gcm::Aes128Gcm>>::new(&key);
+        let mut sw_buf = TestBuffer::<1024>::new(&pt);
+        sw.encrypt_in_place(&nonce, &[], &mut sw_buf).unwrap();
+        check!(slices_eq(&buf.as_slice()[16..], &sw_buf.as_slice()[16..], "gcm-tag"), "AES-128-GCM NIST tag hw==sw");
+    }
+    {
+        // NIST vector with AAD — hw vs sw
+        let key: GenericArray<u8, typenum::U16> = GenericArray::clone_from_slice(&hex!("feffe9928665731c6d6a8f9467308308"));
+        let nonce: GenericArray<u8, typenum::U12> = GenericArray::clone_from_slice(&hex!("cafebabefacedbaddecaf888"));
+        let pt = hex!("d9313225f88406e5a55909c5aff5269a");
+        let aad = hex!("feedfacedeadbeeffeedfacedeadbeefabaddad2");
+
+        let hw = HardwareAesGcm128::new(&key);
+        let mut hw_buf = TestBuffer::<1024>::new(&pt);
+        hw.encrypt_in_place(&nonce, &aad, &mut hw_buf).unwrap();
+
+        let sw = <SoftwareCipher<aes_gcm::Aes128Gcm>>::new(&key);
+        let mut sw_buf = TestBuffer::<1024>::new(&pt);
+        sw.encrypt_in_place(&nonce, &aad, &mut sw_buf).unwrap();
+        check!(slices_eq(hw_buf.as_slice(), sw_buf.as_slice(), "gcm-aad"), "AES-128-GCM NIST+AAD hw==sw");
+    }
+
+    // =================================================================
+    // 10. AES-128-GCM edge cases
+    // =================================================================
+    info!("=== 10. AES-128-GCM edge cases ===");
+    {
+        let key: GenericArray<u8, typenum::U16> = GenericArray::clone_from_slice(&[0x11u8; 16]);
+        let nonce: GenericArray<u8, typenum::U12> = GenericArray::clone_from_slice(&[0x22u8; 12]);
+
+        // Payload sizes
+        let pt_sizes: [usize; 12] = [0, 1, 15, 16, 17, 31, 32, 63, 64, 65, 127, 128];
+        // AAD sizes
+        let aad_sizes: [usize; 6] = [0, 1, 15, 16, 17, 64];
+
+        let mut data = [0u8; 256];
+        fill_pattern(&mut data);
+        let mut aad_data = [0x33u8; 128];
+        fill_pattern(&mut aad_data);
+
+        for &pt_sz in &pt_sizes {
+            for &aad_sz in &aad_sizes {
+                let cipher = HardwareAesGcm128::new(&key);
+                let mut buf = TestBuffer::<1024>::new(&data[..pt_sz]);
+                cipher.encrypt_in_place(&nonce, &aad_data[..aad_sz], &mut buf).unwrap();
+
+                if buf.len() != pt_sz + 16 {
+                    error!("enc output len {} expected {}", buf.len(), pt_sz + 16);
+                    failed += 1;
+                    continue;
+                }
+
+                cipher.decrypt_in_place(&nonce, &aad_data[..aad_sz], &mut buf).unwrap();
+                check!(slices_eq(buf.as_slice(), &data[..pt_sz], "gcm-rt"), "GCM128 RT p/a");
+            }
+        }
+
+        // Large AAD (128B) with small payload (1B)
+        let cipher = HardwareAesGcm128::new(&key);
+        let mut buf = TestBuffer::<1024>::new(&[0x42]);
+        cipher.encrypt_in_place(&nonce, &aad_data[..128], &mut buf).unwrap();
+        cipher.decrypt_in_place(&nonce, &aad_data[..128], &mut buf).unwrap();
+        check!(slices_eq(buf.as_slice(), &[0x42], "gcm-lg-aad"), "GCM128 128B-AAD 1B-PT");
+
+        // Size 129
+        let mut big = [0u8; 129];
+        fill_pattern(&mut big);
+        let cipher = HardwareAesGcm128::new(&key);
+        let mut buf = TestBuffer::<1024>::new(&big);
+        cipher.encrypt_in_place(&nonce, &[], &mut buf).unwrap();
+        cipher.decrypt_in_place(&nonce, &[], &mut buf).unwrap();
+        check!(slices_eq(buf.as_slice(), &big, "gcm-129"), "GCM128 RT 129B");
+
+        // Size 256
+        let cipher = HardwareAesGcm128::new(&key);
+        let mut buf = TestBuffer::<1024>::new(&data);
+        cipher.encrypt_in_place(&nonce, &[], &mut buf).unwrap();
+        cipher.decrypt_in_place(&nonce, &[], &mut buf).unwrap();
+        check!(slices_eq(buf.as_slice(), &data, "gcm-256"), "GCM128 RT 256B");
+    }
+
+    // =================================================================
+    // 11. AES-128-GCM negative tests
+    // =================================================================
+    info!("=== 11. AES-128-GCM negative tests ===");
+    {
+        let key: GenericArray<u8, typenum::U16> = GenericArray::clone_from_slice(&[0x11u8; 16]);
+        let nonce: GenericArray<u8, typenum::U12> = GenericArray::clone_from_slice(&[0x22u8; 12]);
+        let aad = [0x33u8; 16];
+        let pt = [0x44u8; 32];
+        let cipher = HardwareAesGcm128::new(&key);
+
+        // Flip bit in ciphertext
+        {
+            let mut buf = TestBuffer::<1024>::new(&pt);
+            cipher.encrypt_in_place(&nonce, &aad, &mut buf).unwrap();
+            buf.as_mut_slice()[0] ^= 1;
+            check!(cipher.decrypt_in_place(&nonce, &aad, &mut buf).is_err(), "GCM128 tampered CT");
+        }
+        // Flip bit in tag
+        {
+            let mut buf = TestBuffer::<1024>::new(&pt);
+            cipher.encrypt_in_place(&nonce, &aad, &mut buf).unwrap();
+            let last = buf.len() - 1;
+            buf.as_mut_slice()[last] ^= 1;
+            check!(cipher.decrypt_in_place(&nonce, &aad, &mut buf).is_err(), "GCM128 tampered tag");
+        }
+        // Wrong AAD
+        {
+            let mut buf = TestBuffer::<1024>::new(&pt);
+            cipher.encrypt_in_place(&nonce, &aad, &mut buf).unwrap();
+            let wrong_aad = [0x34u8; 16];
+            check!(cipher.decrypt_in_place(&nonce, &wrong_aad, &mut buf).is_err(), "GCM128 wrong AAD");
+        }
+        // Wrong nonce
+        {
+            let mut buf = TestBuffer::<1024>::new(&pt);
+            cipher.encrypt_in_place(&nonce, &aad, &mut buf).unwrap();
+            let wrong_nonce: GenericArray<u8, typenum::U12> = GenericArray::clone_from_slice(&[0x23u8; 12]);
+            check!(cipher.decrypt_in_place(&wrong_nonce, &aad, &mut buf).is_err(), "GCM128 wrong nonce");
+        }
+    }
+
+    // =================================================================
+    // 12. AES-256-GCM tests
+    // =================================================================
+    info!("=== 12. AES-256-GCM tests ===");
+    {
+        let key: GenericArray<u8, typenum::U32> = GenericArray::clone_from_slice(&[0xABu8; 32]);
+        let nonce: GenericArray<u8, typenum::U12> = GenericArray::clone_from_slice(&[0xCDu8; 12]);
+
+        // hw-vs-sw at multiple sizes
+        let sizes: [usize; 3] = [64, 256, 1024];
+        let mut data = [0u8; 1024];
+        fill_pattern(&mut data);
+        for &sz in &sizes {
+            let hw_cipher = HardwareAesGcm256::new(&key);
+            let mut hw_buf = TestBuffer::<4112>::new(&data[..sz]);
+            hw_cipher.encrypt_in_place(&nonce, &[], &mut hw_buf).unwrap();
+
+            let sw_cipher = <SoftwareCipher<aes_gcm::Aes256Gcm>>::new(&key);
+            let mut sw_buf = TestBuffer::<4112>::new(&data[..sz]);
+            sw_cipher.encrypt_in_place(&nonce, &[], &mut sw_buf).unwrap();
+
+            check!(slices_eq(hw_buf.as_slice(), sw_buf.as_slice(), "gcm256-cmp"), "GCM256 hw==sw enc");
+        }
+
+        // Round-trip edge cases
+        let rt_sizes: [usize; 10] = [0, 1, 15, 16, 17, 31, 32, 63, 64, 65];
+        for &sz in &rt_sizes {
+            let cipher = HardwareAesGcm256::new(&key);
+            let mut buf = TestBuffer::<4112>::new(&data[..sz]);
+            cipher.encrypt_in_place(&nonce, &[], &mut buf).unwrap();
+            cipher.decrypt_in_place(&nonce, &[], &mut buf).unwrap();
+            check!(slices_eq(buf.as_slice(), &data[..sz], "gcm256-rt"), "GCM256 RT");
+        }
+
+        // Negative: tag tamper
+        {
+            let cipher = HardwareAesGcm256::new(&key);
+            let mut buf = TestBuffer::<4112>::new(&data[..32]);
+            cipher.encrypt_in_place(&nonce, &[], &mut buf).unwrap();
+            let last = buf.len() - 1;
+            buf.as_mut_slice()[last] ^= 1;
+            check!(cipher.decrypt_in_place(&nonce, &[], &mut buf).is_err(), "GCM256 tampered tag");
+        }
+        // Negative: wrong AAD
+        {
+            let aad = [0xEFu8; 16];
+            let cipher = HardwareAesGcm256::new(&key);
+            let mut buf = TestBuffer::<4112>::new(&data[..32]);
+            cipher.encrypt_in_place(&nonce, &aad, &mut buf).unwrap();
+            let wrong_aad = [0xFEu8; 16];
+            check!(cipher.decrypt_in_place(&nonce, &wrong_aad, &mut buf).is_err(), "GCM256 wrong AAD");
+        }
+    }
+
+    // =================================================================
+    // 13. AES-256-GCM KAT (hw vs sw, all-zero)
+    // =================================================================
+    info!("=== 13. AES-256-GCM KAT ===");
+    {
+        let key: GenericArray<u8, typenum::U32> = GenericArray::clone_from_slice(&[0u8; 32]);
+        let nonce: GenericArray<u8, typenum::U12> = GenericArray::clone_from_slice(&[0u8; 12]);
+
+        let hw_cipher = HardwareAesGcm256::new(&key);
+        let mut hw_buf = TestBuffer::<4112>::new(&[]);
+        hw_cipher.encrypt_in_place(&nonce, &[], &mut hw_buf).unwrap();
+
+        let sw_cipher = <SoftwareCipher<aes_gcm::Aes256Gcm>>::new(&key);
+        let mut sw_buf = TestBuffer::<4112>::new(&[]);
+        sw_cipher.encrypt_in_place(&nonce, &[], &mut sw_buf).unwrap();
+
+        check!(slices_eq(hw_buf.as_slice(), sw_buf.as_slice(), "gcm256-zero"), "GCM256 all-zero hw==sw");
+    }
+
+    // =================================================================
     // Summary
-    // ===================================================================
+    // =================================================================
     info!("");
     info!("=== SUMMARY: {} passed, {} failed ===", passed, failed);
     if failed > 0 {
