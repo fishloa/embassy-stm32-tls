@@ -53,6 +53,62 @@ fn measure(f: impl FnOnce()) -> u32 {
 // 4KB buffer for larger payload tests.
 static mut BUF_A: [u8; 4112] = [0u8; 4112]; // 4096 + 16 tag
 
+// Stack measurement via a dedicated probe buffer.
+// The function under test runs on the main stack; we measure SP delta.
+const STACK_SENTINEL: u32 = 0xDEAD_C0DE;
+const STACK_PROBE_WORDS: usize = 2048; // 8KB probe zone
+static mut STACK_PROBE: [u32; STACK_PROBE_WORDS] = [0; STACK_PROBE_WORDS];
+
+/// Paint the stack probe zone with a sentinel.
+fn stack_probe_paint() {
+    let ptr = core::ptr::addr_of_mut!(STACK_PROBE) as *mut u32;
+    for i in 0..STACK_PROBE_WORDS {
+        unsafe { ptr.add(i).write_volatile(STACK_SENTINEL) };
+    }
+}
+
+/// Measure how many bytes of the probe zone were consumed.
+/// Scans from index 0 (lowest address) upward — deepest stack usage
+/// overwrites from the top of the array downward.
+fn stack_probe_measure() -> usize {
+    let ptr = core::ptr::addr_of!(STACK_PROBE) as *const u32;
+    for i in 0..STACK_PROBE_WORDS {
+        if unsafe { ptr.add(i).read_volatile() } != STACK_SENTINEL {
+            return (STACK_PROBE_WORDS - i) * 4;
+        }
+    }
+    0
+}
+
+/// Measure peak stack usage of a closure.
+///
+/// Moves SP into the pre-painted probe zone, runs `f()`, restores SP,
+/// then scans for the high-water mark. Interrupts are disabled during
+/// measurement since the probe zone becomes the active stack.
+#[inline(never)]
+fn measure_stack(f: impl FnOnce()) -> usize {
+    stack_probe_paint();
+    unsafe {
+        let probe_top =
+            (core::ptr::addr_of!(STACK_PROBE) as *const u32).add(STACK_PROBE_WORDS) as u32;
+        let saved_sp: u32;
+        core::arch::asm!(
+            "mov {saved}, sp",
+            "mov sp, {top}",
+            saved = out(reg) saved_sp,
+            top = in(reg) probe_top,
+        );
+        cortex_m::interrupt::free(|_| {
+            f();
+        });
+        core::arch::asm!(
+            "mov sp, {saved}",
+            saved = in(reg) saved_sp,
+        );
+    }
+    stack_probe_measure()
+}
+
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     let p = embassy_stm32::init_primary(Default::default(), &SHARED);
@@ -76,6 +132,21 @@ async fn main(_spawner: Spawner) {
     let hkdf_info = [0x04u8; 32];
 
     info!("=== Embassy STM32 TLS Crypto Benchmark ===");
+    info!("");
+
+    // ── Memory: type sizes (stack cost per instance) ─────────
+    info!("--- Type sizes (bytes) ---");
+    info!("  HardwareAesGcm128:    {}", core::mem::size_of::<HardwareAesGcm128>());
+    info!("  SoftwareCipher<128>:  {}", core::mem::size_of::<SoftwareCipher<aes_gcm::Aes128Gcm>>());
+    info!("  HardwareAesGcm256:    {}", core::mem::size_of::<HardwareAesGcm256>());
+    info!("  SoftwareCipher<256>:  {}", core::mem::size_of::<SoftwareCipher<aes_gcm::Aes256Gcm>>());
+    info!("  HardwareSha256:       {}", core::mem::size_of::<HardwareSha256>());
+    info!("  SoftwareHash<Sha256>: {}", core::mem::size_of::<SoftwareHash<sha2::Sha256>>());
+    info!("  HardwareHmacSha256:   {}", core::mem::size_of::<HardwareHmacSha256>());
+    info!("  SoftwareHmac<Sha256>: {}", core::mem::size_of::<SoftwareHmac<sha2::Sha256>>());
+    info!("  HardwareHkdfSha256:   {}", core::mem::size_of::<HardwareHkdfSha256>());
+    info!("  SoftwareHkdf<Sha256>: {}", core::mem::size_of::<SoftwareHkdf<sha2::Sha256>>());
+    info!("  TestBuffer<4112>:     {}", core::mem::size_of::<TestBuffer<4112>>());
     info!("");
 
     // ── SHA-256 (TlsHash) ──────────────────────────────────────
@@ -216,6 +287,78 @@ async fn main(_spawner: Spawner) {
         });
         info!("AES-256-GCM dec {}B:  HW={} SW={} ({}x)", sz, hw, sw, sw / hw.max(1));
     }
+
+    // ── Stack usage (256B payload) ─────────────────────────────
+    info!("");
+    info!("--- Peak stack usage (bytes, 256B payload) ---");
+    {
+        let data = unsafe { &BUF_A[..256] };
+
+        let hw = measure_stack(|| {
+            let mut h = HardwareSha256::new();
+            h.update(data);
+            let _ = h.finalize();
+        });
+        let sw = measure_stack(|| {
+            let mut h = <SoftwareHash<sha2::Sha256>>::new();
+            h.update(data);
+            let _ = h.finalize();
+        });
+        info!("  SHA-256:       HW={} SW={}", hw, sw);
+
+        let hw = measure_stack(|| {
+            let mut h = HardwareHmacSha256::new_from_slice(&hmac_key).unwrap();
+            h.update(data);
+            let _ = h.finalize();
+        });
+        let sw = measure_stack(|| {
+            let mut h = <SoftwareHmac<sha2::Sha256>>::new_from_slice(&hmac_key).unwrap();
+            h.update(data);
+            let _ = h.finalize();
+        });
+        info!("  HMAC-SHA-256:  HW={} SW={}", hw, sw);
+
+        let hw = measure_stack(|| {
+            let (_, hkdf) = HardwareHkdfSha256::extract(Some(&hkdf_salt), &hkdf_ikm);
+            let mut out = [0u8; 48];
+            hkdf.expand(&hkdf_info, &mut out).unwrap();
+        });
+        let sw = measure_stack(|| {
+            let (_, hkdf) = <SoftwareHkdf<sha2::Sha256>>::extract(Some(&hkdf_salt), &hkdf_ikm);
+            let mut out = [0u8; 48];
+            hkdf.expand(&hkdf_info, &mut out).unwrap();
+        });
+        info!("  HKDF:          HW={} SW={}", hw, sw);
+
+        let hw = measure_stack(|| {
+            let cipher = HardwareAesGcm128::new(&aes128_key);
+            let mut buf = TestBuffer::<1024>::new(data);
+            cipher.encrypt_in_place(&nonce, &aad, &mut buf).unwrap();
+        });
+        let sw = measure_stack(|| {
+            let cipher = <SoftwareCipher<aes_gcm::Aes128Gcm>>::new(&aes128_key);
+            let mut buf = TestBuffer::<1024>::new(data);
+            cipher.encrypt_in_place(&nonce, &aad, &mut buf).unwrap();
+        });
+        info!("  AES-128-GCM:   HW={} SW={}", hw, sw);
+
+        let hw = measure_stack(|| {
+            let cipher = HardwareAesGcm256::new(&aes256_key);
+            let mut buf = TestBuffer::<1024>::new(data);
+            cipher.encrypt_in_place(&nonce, &aad, &mut buf).unwrap();
+        });
+        let sw = measure_stack(|| {
+            let cipher = <SoftwareCipher<aes_gcm::Aes256Gcm>>::new(&aes256_key);
+            let mut buf = TestBuffer::<1024>::new(data);
+            cipher.encrypt_in_place(&nonce, &aad, &mut buf).unwrap();
+        });
+        info!("  AES-256-GCM:   HW={} SW={}", hw, sw);
+    }
+
+    // ── Flash size note ──────────────────────────────────────
+    info!("");
+    info!("--- Flash size ---");
+    info!("  Compare with: cargo size --example benchmark --release --target thumbv7em-none-eabihf");
 
     // ── Round-trip correctness ─────────────────────────────────
     info!("");
