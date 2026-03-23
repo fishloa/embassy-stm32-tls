@@ -17,8 +17,8 @@ operations for STM32H7 microcontrollers, using the CRYP (AES-GCM) and HASH
 | `Stm32H7Aes256GcmSha384` | HW CRYP | SW RustCrypto | SW | SW |
 
 The AES-256 suite is hybrid because the STM32H755 HASH peripheral (v2) only
-supports up to SHA-256. On chips with HASH v3+ (e.g. STM32H5), SHA-384 could
-also be hardware-accelerated.
+supports up to SHA-256. On chips with HASH v3 (e.g. STM32H5 series), SHA-384 is available in
+hardware and could also be accelerated.
 
 ### Hardware implementations
 

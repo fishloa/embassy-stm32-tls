@@ -39,7 +39,8 @@ impl TlsCipherSuite for Stm32H7Aes128GcmSha256 {
 ///
 /// The AES-256-GCM cipher uses the STM32H7 CRYP peripheral. SHA-384, HMAC,
 /// and HKDF use software (RustCrypto) because the STM32H755 HASH peripheral
-/// (v2) only supports up to SHA-256.
+/// (v2) only supports up to SHA-256. On chips with HASH v3 (e.g. STM32H5),
+/// SHA-384 is available in hardware.
 pub struct Stm32H7Aes256GcmSha384;
 
 impl TlsCipherSuite for Stm32H7Aes256GcmSha384 {
