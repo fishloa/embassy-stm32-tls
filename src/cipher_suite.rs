@@ -1,35 +1,28 @@
-//! Hardware-accelerated TLS 1.3 cipher suite for AES-128-GCM with SHA-256.
+//! Hardware-accelerated TLS 1.3 cipher suites for STM32H7.
 
-use embedded_tls::TlsCipherSuite;
-use typenum::{U12, U16, U22, U32};
+use embedded_tls::{SoftwareHkdf, SoftwareHmac, TlsCipherSuite};
+use sha2::Sha384;
+use typenum::{U12, U16, U22, U32, U48};
 
-use crate::hardware::cipher::HardwareAesGcm128;
+use crate::hardware::cipher::{HardwareAesGcm128, HardwareAesGcm256};
 use crate::hardware::hash::HardwareSha256;
 use crate::hardware::hkdf::HardwareHkdfSha256;
 use crate::hardware::hmac::HardwareHmacSha256;
 
-/// AES-128-GCM + SHA-256 cipher suite using STM32H7 hardware acceleration.
+// LabelBuffer = HashOutput + LongestLabel(12) + LabelOverhead(10)
+// SHA-256: 32 + 22 = 54
+type U54 = typenum::Sum<U32, U22>;
+// SHA-384: 48 + 22 = 70
+type U70 = typenum::Sum<U48, U22>;
+
+/// AES-128-GCM + SHA-256 cipher suite — fully hardware-accelerated.
 ///
-/// Drop-in replacement for the software `Aes128GcmSha256` — just change
-/// the type parameter on your [`CryptoProvider`](embedded_tls::CryptoProvider).
+/// All four crypto operations (cipher, hash, HMAC, HKDF) use the STM32H7
+/// CRYP and HASH peripherals.
 pub struct Stm32H7Aes128GcmSha256;
 
-// LabelBuffer = HashOutput(32) + LongestLabel(12) + LabelOverhead(10) = 54
-// But the trait uses typenum Sum<OutputSize, Sum<U12, U10>>.
-// U32 + U12 + U10 = U54. We need to express this properly.
-// Actually, looking at config.rs the LabelBuffer type is:
-//   Sum<<<CipherSuite as TlsCipherSuite>::Hash as TlsHash>::OutputSize, Sum<LongestLabel, LabelOverhead>>
-// where LongestLabel = U12, LabelOverhead = U10.
-// So for SHA-256 (OutputSize = U32): U32 + U22 = U54.
-// But the existing Aes128GcmSha256 uses `LabelBuffer<Self>` which computes this.
-// We need to provide a concrete type. typenum::U54 should work.
-// Since we can't use the type alias from embedded-tls's config module,
-// we compute it manually: U32 + U12 + U10 = U54.
-type U54 = typenum::Sum<U32, U22>;
-
 impl TlsCipherSuite for Stm32H7Aes128GcmSha256 {
-    // TLS_AES_128_GCM_SHA256 = 0x1301
-    const CODE_POINT: u16 = 0x1301;
+    const CODE_POINT: u16 = 0x1301; // TLS_AES_128_GCM_SHA256
 
     type Cipher = HardwareAesGcm128;
     type KeyLen = U16;
@@ -40,4 +33,25 @@ impl TlsCipherSuite for Stm32H7Aes128GcmSha256 {
 
     type Hmac = HardwareHmacSha256;
     type Hkdf = HardwareHkdfSha256;
+}
+
+/// AES-256-GCM + SHA-384 cipher suite — hardware cipher, software hash.
+///
+/// The AES-256-GCM cipher uses the STM32H7 CRYP peripheral. SHA-384, HMAC,
+/// and HKDF use software (RustCrypto) because the STM32H755 HASH peripheral
+/// (v2) only supports up to SHA-256.
+pub struct Stm32H7Aes256GcmSha384;
+
+impl TlsCipherSuite for Stm32H7Aes256GcmSha384 {
+    const CODE_POINT: u16 = 0x1302; // TLS_AES_256_GCM_SHA384
+
+    type Cipher = HardwareAesGcm256;
+    type KeyLen = U32;
+    type IvLen = U12;
+
+    type Hash = embedded_tls::SoftwareHash<Sha384>;
+    type LabelBufferSize = U70;
+
+    type Hmac = SoftwareHmac<Sha384>;
+    type Hkdf = SoftwareHkdf<Sha384>;
 }
