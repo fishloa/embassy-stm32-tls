@@ -1,7 +1,7 @@
 //! Hardware vs software crypto benchmark for NUCLEO-H755ZI-Q (Cortex-M7).
 //!
-//! Measures cycle counts for SHA-256, HMAC-SHA-256, HKDF-SHA-256, and
-//! AES-128-GCM encrypt using both hardware and software implementations.
+//! Measures cycle counts for all TLS crypto operations at multiple payload
+//! sizes, comparing hardware (STM32H7 CRYP/HASH) against software (RustCrypto).
 //!
 //! Run with: cargo run --example benchmark --release --target thumbv7em-none-eabihf
 
@@ -17,16 +17,17 @@ use embassy_stm32::cryp::{self, Cryp};
 use embassy_stm32::hash::{self, Hash};
 use embassy_stm32::rng::Rng;
 use embassy_stm32::{bind_interrupts, peripherals, rng};
-use embedded_tls::{TlsBuffer, TlsCipher, TlsHash, TlsHkdf, TlsHmac};
 use embedded_tls::{SoftwareCipher, SoftwareHash, SoftwareHkdf, SoftwareHmac};
+use embedded_tls::{TlsBuffer, TlsCipher, TlsHash, TlsHkdf, TlsHmac};
 use generic_array::GenericArray;
 use {defmt_rtt as _, panic_probe as _};
 
-use embassy_stm32_tls::{TestBuffer, hardware};
-use embassy_stm32_tls::hardware::cipher::HardwareAesGcm128;
+use embassy_stm32_tls::hardware;
+use embassy_stm32_tls::hardware::cipher::{HardwareAesGcm128, HardwareAesGcm256};
 use embassy_stm32_tls::hardware::hash::HardwareSha256;
 use embassy_stm32_tls::hardware::hkdf::HardwareHkdfSha256;
 use embassy_stm32_tls::hardware::hmac::HardwareHmacSha256;
+use embassy_stm32_tls::TestBuffer;
 
 bind_interrupts!(struct Irqs {
     HASH_RNG => rng::InterruptHandler<peripherals::RNG>,
@@ -36,163 +37,205 @@ bind_interrupts!(struct Irqs {
 
 static SHARED: MaybeUninit<embassy_stm32::SharedData> = MaybeUninit::uninit();
 
-/// Read the DWT cycle counter.
 #[inline(always)]
 fn cycles() -> u32 {
     DWT::cycle_count()
 }
 
+/// Run a closure and return elapsed cycles.
+#[inline(never)]
+fn measure(f: impl FnOnce()) -> u32 {
+    let t0 = cycles();
+    f();
+    cycles().wrapping_sub(t0)
+}
+
+// 4KB buffer for larger payload tests.
+static mut BUF_A: [u8; 4112] = [0u8; 4112]; // 4096 + 16 tag
+
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     let p = embassy_stm32::init_primary(Default::default(), &SHARED);
 
-    // Enable the DWT cycle counter for precise timing.
     let mut core = cortex_m::Peripherals::take().unwrap();
     core.DCB.enable_trace();
     core.DWT.enable_cycle_counter();
 
-    // Initialise hardware crypto peripherals.
     let cryp_peri = Cryp::new_blocking(p.CRYP, Irqs);
     let hash_peri = Hash::new_blocking(p.HASH, Irqs);
     hardware::init(cryp_peri, hash_peri);
-
-    // Initialise RNG (available for future use).
     let _rng = Rng::new(p.RNG, Irqs);
 
-    // --- Test data ---
-    let test_data = [0x42u8; 256]; // 256 bytes of payload
-    let aes_key: GenericArray<u8, typenum::U16> = GenericArray::clone_from_slice(&[0xABu8; 16]);
-    let aes_nonce: GenericArray<u8, typenum::U12> = GenericArray::clone_from_slice(&[0xCDu8; 12]);
-    let aad = [0xEFu8; 13];
+    let aes128_key: GenericArray<u8, typenum::U16> = GenericArray::clone_from_slice(&[0xABu8; 16]);
+    let aes256_key: GenericArray<u8, typenum::U32> = GenericArray::clone_from_slice(&[0xCDu8; 32]);
+    let nonce: GenericArray<u8, typenum::U12> = GenericArray::clone_from_slice(&[0xEFu8; 12]);
+    let aad = [0x33u8; 13];
     let hmac_key = [0x01u8; 32];
     let hkdf_salt = [0x02u8; 32];
     let hkdf_ikm = [0x03u8; 32];
     let hkdf_info = [0x04u8; 32];
 
     info!("=== Embassy STM32 TLS Crypto Benchmark ===");
-    info!("Payload: {} bytes", test_data.len());
     info!("");
 
-    // -------------------------------------------------------
-    // SHA-256
-    // -------------------------------------------------------
-    info!("--- SHA-256 ({} bytes) ---", test_data.len());
+    // ── SHA-256 (TlsHash) ──────────────────────────────────────
+    for &size in &[64u16, 256, 1024, 4096] {
+        let sz = size as usize;
+        let data = unsafe { &mut BUF_A[..sz] };
+        data.fill(0x42);
 
-    // Hardware
-    let t0 = cycles();
-    {
-        let mut h = HardwareSha256::new();
-        h.update(&test_data);
-        let _digest = h.finalize();
+        let hw = measure(|| {
+            let mut h = HardwareSha256::new();
+            h.update(data);
+            let _ = h.finalize();
+        });
+        let sw = measure(|| {
+            let mut h = <SoftwareHash<sha2::Sha256>>::new();
+            h.update(data);
+            let _ = h.finalize();
+        });
+        info!("SHA-256 {}B:  HW={} SW={} ({}x)", sz, hw, sw, sw / hw.max(1));
     }
-    let hw_sha = cycles().wrapping_sub(t0);
-    info!("  HW:  {} cycles", hw_sha);
 
-    // Software
-    let t0 = cycles();
-    {
-        let mut h = <SoftwareHash<sha2::Sha256>>::new();
-        h.update(&test_data);
-        let _digest = h.finalize();
-    }
-    let sw_sha = cycles().wrapping_sub(t0);
-    info!("  SW:  {} cycles", sw_sha);
-    info!("  Speedup: {}x", sw_sha / hw_sha.max(1));
-
-    // -------------------------------------------------------
-    // HMAC-SHA-256
-    // -------------------------------------------------------
+    // ── HMAC-SHA-256 (TlsHmac) ────────────────────────────────
     info!("");
-    info!("--- HMAC-SHA-256 ({} bytes) ---", test_data.len());
+    for &size in &[64u16, 256, 1024, 4096] {
+        let sz = size as usize;
+        let data = unsafe { &mut BUF_A[..sz] };
+        data.fill(0x77);
 
-    // Hardware
-    let t0 = cycles();
-    {
-        let mut h = HardwareHmacSha256::new_from_slice(&hmac_key).unwrap();
-        h.update(&test_data);
-        let _tag = h.finalize();
+        let hw = measure(|| {
+            let mut h = HardwareHmacSha256::new_from_slice(&hmac_key).unwrap();
+            h.update(data);
+            let _ = h.finalize();
+        });
+        let sw = measure(|| {
+            let mut h = <SoftwareHmac<sha2::Sha256>>::new_from_slice(&hmac_key).unwrap();
+            h.update(data);
+            let _ = h.finalize();
+        });
+        info!("HMAC-SHA-256 {}B:  HW={} SW={} ({}x)", sz, hw, sw, sw / hw.max(1));
     }
-    let hw_hmac = cycles().wrapping_sub(t0);
-    info!("  HW:  {} cycles", hw_hmac);
 
-    // Software
-    let t0 = cycles();
-    {
-        let mut h = <SoftwareHmac<sha2::Sha256>>::new_from_slice(&hmac_key).unwrap();
-        h.update(&test_data);
-        let _tag = h.finalize();
-    }
-    let sw_hmac = cycles().wrapping_sub(t0);
-    info!("  SW:  {} cycles", sw_hmac);
-    info!("  Speedup: {}x", sw_hmac / hw_hmac.max(1));
-
-    // -------------------------------------------------------
-    // HKDF-SHA-256
-    // -------------------------------------------------------
+    // ── HKDF-SHA-256 (TlsHkdf) ────────────────────────────────
     info!("");
-    info!("--- HKDF-SHA-256 (extract + expand 48 bytes) ---");
-
-    // Hardware
-    let t0 = cycles();
-    {
-        let (_prk, hkdf) = HardwareHkdfSha256::extract(Some(&hkdf_salt), &hkdf_ikm);
-        let mut out = [0u8; 48];
-        hkdf.expand(&hkdf_info, &mut out).unwrap();
+    for &expand_len in &[32u16, 48, 64, 128] {
+        let elen = expand_len as usize;
+        let hw = measure(|| {
+            let (_, hkdf) = HardwareHkdfSha256::extract(Some(&hkdf_salt), &hkdf_ikm);
+            let mut out = [0u8; 128];
+            hkdf.expand(&hkdf_info, &mut out[..elen]).unwrap();
+        });
+        let sw = measure(|| {
+            let (_, hkdf) = <SoftwareHkdf<sha2::Sha256>>::extract(Some(&hkdf_salt), &hkdf_ikm);
+            let mut out = [0u8; 128];
+            hkdf.expand(&hkdf_info, &mut out[..elen]).unwrap();
+        });
+        info!("HKDF expand {}B:  HW={} SW={} ({}x)", elen, hw, sw, sw / hw.max(1));
     }
-    let hw_hkdf = cycles().wrapping_sub(t0);
-    info!("  HW:  {} cycles", hw_hkdf);
 
-    // Software
-    let t0 = cycles();
-    {
-        let (_prk, hkdf) =
-            <SoftwareHkdf<sha2::Sha256>>::extract(Some(&hkdf_salt), &hkdf_ikm);
-        let mut out = [0u8; 48];
-        hkdf.expand(&hkdf_info, &mut out).unwrap();
-    }
-    let sw_hkdf = cycles().wrapping_sub(t0);
-    info!("  SW:  {} cycles", sw_hkdf);
-    info!("  Speedup: {}x", sw_hkdf / hw_hkdf.max(1));
-
-    // -------------------------------------------------------
-    // AES-128-GCM encrypt
-    // -------------------------------------------------------
+    // ── AES-128-GCM encrypt (TlsCipher) ───────────────────────
     info!("");
-    info!("--- AES-128-GCM encrypt ({} bytes) ---", test_data.len());
+    for &size in &[64u16, 256, 1024, 4096] {
+        let sz = size as usize;
 
-    // Hardware
-    let t0 = cycles();
-    {
-        let cipher = HardwareAesGcm128::new(&aes_key);
-        let mut buf = TestBuffer::<1024>::new(&test_data);
-        cipher.encrypt_in_place(&aes_nonce, &aad, &mut buf).unwrap();
+        let hw = measure(|| {
+            let cipher = HardwareAesGcm128::new(&aes128_key);
+            let mut buf = TestBuffer::<4112>::new(unsafe { &BUF_A[..sz] });
+            cipher.encrypt_in_place(&nonce, &aad, &mut buf).unwrap();
+        });
+        let sw = measure(|| {
+            let cipher = <SoftwareCipher<aes_gcm::Aes128Gcm>>::new(&aes128_key);
+            let mut buf = TestBuffer::<4112>::new(unsafe { &BUF_A[..sz] });
+            cipher.encrypt_in_place(&nonce, &aad, &mut buf).unwrap();
+        });
+        info!("AES-128-GCM enc {}B:  HW={} SW={} ({}x)", sz, hw, sw, sw / hw.max(1));
     }
-    let hw_aes = cycles().wrapping_sub(t0);
-    info!("  HW:  {} cycles", hw_aes);
 
-    // Software
-    let t0 = cycles();
-    {
-        let cipher = <SoftwareCipher<aes_gcm::Aes128Gcm>>::new(&aes_key);
-        let mut buf = TestBuffer::<1024>::new(&test_data);
-        cipher.encrypt_in_place(&aes_nonce, &aad, &mut buf).unwrap();
-    }
-    let sw_aes = cycles().wrapping_sub(t0);
-    info!("  SW:  {} cycles", sw_aes);
-    info!("  Speedup: {}x", sw_aes / hw_aes.max(1));
-
-    // -------------------------------------------------------
-    // AES-128-GCM decrypt (round-trip verification)
-    // -------------------------------------------------------
+    // ── AES-128-GCM decrypt ───────────────────────────────────
     info!("");
-    info!("--- AES-128-GCM encrypt+decrypt round-trip ---");
+    for &size in &[64u16, 256, 1024, 4096] {
+        let sz = size as usize;
+
+        // Prepare ciphertext with hw encrypt.
+        let cipher = HardwareAesGcm128::new(&aes128_key);
+        let mut prep = TestBuffer::<4112>::new(unsafe { &BUF_A[..sz] });
+        cipher.encrypt_in_place(&nonce, &aad, &mut prep).unwrap();
+        let ct = prep.as_slice();
+
+        let hw = measure(|| {
+            let cipher = HardwareAesGcm128::new(&aes128_key);
+            let mut buf = TestBuffer::<4112>::new(ct);
+            cipher.decrypt_in_place(&nonce, &aad, &mut buf).unwrap();
+        });
+        let sw = measure(|| {
+            let cipher = <SoftwareCipher<aes_gcm::Aes128Gcm>>::new(&aes128_key);
+            let mut buf = TestBuffer::<4112>::new(ct);
+            cipher.decrypt_in_place(&nonce, &aad, &mut buf).unwrap();
+        });
+        info!("AES-128-GCM dec {}B:  HW={} SW={} ({}x)", sz, hw, sw, sw / hw.max(1));
+    }
+
+    // ── AES-256-GCM encrypt ───────────────────────────────────
+    info!("");
+    for &size in &[64u16, 256, 1024, 4096] {
+        let sz = size as usize;
+
+        let hw = measure(|| {
+            let cipher = HardwareAesGcm256::new(&aes256_key);
+            let mut buf = TestBuffer::<4112>::new(unsafe { &BUF_A[..sz] });
+            cipher.encrypt_in_place(&nonce, &aad, &mut buf).unwrap();
+        });
+        let sw = measure(|| {
+            let cipher = <SoftwareCipher<aes_gcm::Aes256Gcm>>::new(&aes256_key);
+            let mut buf = TestBuffer::<4112>::new(unsafe { &BUF_A[..sz] });
+            cipher.encrypt_in_place(&nonce, &aad, &mut buf).unwrap();
+        });
+        info!("AES-256-GCM enc {}B:  HW={} SW={} ({}x)", sz, hw, sw, sw / hw.max(1));
+    }
+
+    // ── AES-256-GCM decrypt ───────────────────────────────────
+    info!("");
+    for &size in &[64u16, 256, 1024, 4096] {
+        let sz = size as usize;
+
+        let cipher = HardwareAesGcm256::new(&aes256_key);
+        let mut prep = TestBuffer::<4112>::new(unsafe { &BUF_A[..sz] });
+        cipher.encrypt_in_place(&nonce, &aad, &mut prep).unwrap();
+        let ct = prep.as_slice();
+
+        let hw = measure(|| {
+            let cipher = HardwareAesGcm256::new(&aes256_key);
+            let mut buf = TestBuffer::<4112>::new(ct);
+            cipher.decrypt_in_place(&nonce, &aad, &mut buf).unwrap();
+        });
+        let sw = measure(|| {
+            let cipher = <SoftwareCipher<aes_gcm::Aes256Gcm>>::new(&aes256_key);
+            let mut buf = TestBuffer::<4112>::new(ct);
+            cipher.decrypt_in_place(&nonce, &aad, &mut buf).unwrap();
+        });
+        info!("AES-256-GCM dec {}B:  HW={} SW={} ({}x)", sz, hw, sw, sw / hw.max(1));
+    }
+
+    // ── Round-trip correctness ─────────────────────────────────
+    info!("");
     {
-        let cipher = HardwareAesGcm128::new(&aes_key);
-        let mut buf = TestBuffer::<1024>::new(&test_data);
-        cipher.encrypt_in_place(&aes_nonce, &aad, &mut buf).unwrap();
-        cipher.decrypt_in_place(&aes_nonce, &aad, &mut buf).unwrap();
-        defmt::assert_eq!(&buf.as_slice()[..test_data.len()], &test_data[..]);
-        info!("  HW round-trip: OK");
+        let cipher = HardwareAesGcm128::new(&aes128_key);
+        let data = [0x42u8; 256];
+        let mut buf = TestBuffer::<1024>::new(&data);
+        cipher.encrypt_in_place(&nonce, &aad, &mut buf).unwrap();
+        cipher.decrypt_in_place(&nonce, &aad, &mut buf).unwrap();
+        defmt::assert_eq!(buf.as_slice(), &data[..]);
+        info!("AES-128-GCM round-trip: OK");
+    }
+    {
+        let cipher = HardwareAesGcm256::new(&aes256_key);
+        let data = [0x42u8; 256];
+        let mut buf = TestBuffer::<1024>::new(&data);
+        cipher.encrypt_in_place(&nonce, &aad, &mut buf).unwrap();
+        cipher.decrypt_in_place(&nonce, &aad, &mut buf).unwrap();
+        defmt::assert_eq!(buf.as_slice(), &data[..]);
+        info!("AES-256-GCM round-trip: OK");
     }
 
     info!("");
