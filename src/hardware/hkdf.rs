@@ -4,9 +4,12 @@
 //! implementation inherits the hardware SHA-256 acceleration from
 //! [`super::hmac::HardwareHmacSha256`].
 
+use core::cmp;
+
 use embedded_tls::{TlsError, TlsHkdf, TlsHmac};
 use generic_array::GenericArray;
 use typenum::U32;
+use zeroize::Zeroize;
 
 use super::hmac::HardwareHmacSha256;
 
@@ -14,6 +17,12 @@ use super::hmac::HardwareHmacSha256;
 pub struct HardwareHkdfSha256 {
     /// The pseudo-random key from the extract step.
     prk: [u8; 32],
+}
+
+impl Drop for HardwareHkdfSha256 {
+    fn drop(&mut self) {
+        self.prk.zeroize();
+    }
 }
 
 impl TlsHkdf for HardwareHkdfSha256 {
@@ -70,7 +79,7 @@ impl TlsHkdf for HardwareHkdfSha256 {
             let result = hmac.finalize();
             t.copy_from_slice(result.as_slice());
 
-            let copy_len = core::cmp::min(hash_len, output.len() - offset);
+            let copy_len = cmp::min(hash_len, output.len() - offset);
             output[offset..offset + copy_len].copy_from_slice(&t[..copy_len]);
             offset += copy_len;
         }

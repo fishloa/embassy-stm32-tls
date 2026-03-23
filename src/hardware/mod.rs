@@ -27,12 +27,26 @@ static HASH: Mutex<RefCell<Option<stm32_hash::Hash<'static, peripherals::HASH, B
 /// Must be called exactly once before any hardware cipher suite operation.
 /// The peripherals are moved into module-level statics and accessed through
 /// critical sections.
+///
+/// # Panics
+///
+/// Panics if called more than once. This guards against accidental
+/// double-initialisation which would silently discard the first peripheral.
+///
+/// # Important
+///
+/// On some STM32H7 variants, the RNG peripheral must be initialised before
+/// the CRYP and HASH peripherals. Ensure your RNG is set up before calling
+/// this function.
 pub fn init(
     cryp_peri: cryp::Cryp<'static, peripherals::CRYP, Blocking>,
     hash_peri: stm32_hash::Hash<'static, peripherals::HASH, Blocking>,
 ) {
     critical_section::with(|cs| {
-        CRYP.borrow_ref_mut(cs).replace(cryp_peri);
+        let mut cryp_ref = CRYP.borrow_ref_mut(cs);
+        assert!(cryp_ref.is_none(), "hardware::init() called more than once");
+        cryp_ref.replace(cryp_peri);
+
         HASH.borrow_ref_mut(cs).replace(hash_peri);
     });
 }

@@ -13,8 +13,14 @@ pub struct TestBuffer<const N: usize> {
 
 impl<const N: usize> TestBuffer<N> {
     /// Create a buffer pre-filled with `initial` data.
+    #[must_use]
     pub fn new(initial: &[u8]) -> Self {
-        assert!(initial.len() <= N);
+        assert!(
+            initial.len() <= N,
+            "initial data length ({}) exceeds buffer capacity ({})",
+            initial.len(),
+            N,
+        );
         let mut buf = Self {
             data: [0u8; N],
             len: initial.len(),
@@ -24,6 +30,7 @@ impl<const N: usize> TestBuffer<N> {
     }
 
     /// Create an empty buffer.
+    #[must_use]
     pub fn empty() -> Self {
         Self {
             data: [0u8; N],

@@ -1,10 +1,13 @@
 //! Hardware AES-GCM ciphers using the STM32H7 CRYP peripheral.
 
-use embedded_tls::{TlsBuffer, TlsCipher, TlsError};
-use generic_array::GenericArray;
-use typenum::{U12, U16, U32};
+use core::convert::TryInto;
 
 use embassy_stm32::cryp::{AesGcm, Direction};
+use embedded_tls::{TlsBuffer, TlsCipher, TlsError};
+use generic_array::GenericArray;
+use subtle::ConstantTimeEq;
+use typenum::{U12, U16, U32};
+use zeroize::Zeroize;
 
 use super::with_cryp;
 
@@ -54,17 +57,23 @@ fn process_payload_in_place<'c, C>(
 
 /// Constant-time tag comparison.
 fn verify_tag(computed: &[u8; 16], received: &[u8; 16]) -> Result<(), TlsError> {
-    let mut diff = 0u8;
-    for (a, b) in computed.iter().zip(received.iter()) {
-        diff |= a ^ b;
+    if computed.ct_eq(received).into() {
+        Ok(())
+    } else {
+        Err(TlsError::CryptoError)
     }
-    if diff != 0 { Err(TlsError::CryptoError) } else { Ok(()) }
 }
 
 macro_rules! impl_hardware_aes_gcm {
     ($name:ident, $key_size:literal, $key_typenum:ty) => {
         pub struct $name {
             key: [u8; $key_size],
+        }
+
+        impl Drop for $name {
+            fn drop(&mut self) {
+                self.key.zeroize();
+            }
         }
 
         impl TlsCipher for $name {

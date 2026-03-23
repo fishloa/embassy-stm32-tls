@@ -4,11 +4,14 @@
 //! hardware SHA-256 engine, avoiding self-referential lifetime issues
 //! that would arise from the HASH peripheral's native HMAC mode.
 
-use embedded_tls::{TlsHmac, TlsError};
-use generic_array::GenericArray;
-use typenum::U32;
+use core::mem;
 
 use embassy_stm32::hash::{Algorithm, Context, DataType};
+use embedded_tls::{TlsError, TlsHmac};
+use generic_array::GenericArray;
+use subtle::ConstantTimeEq;
+use typenum::U32;
+use zeroize::Zeroize;
 
 use super::with_hash;
 
@@ -27,6 +30,12 @@ pub struct HardwareHmacSha256 {
     outer_key_pad: [u8; SHA256_BLOCK_SIZE],
 }
 
+impl Drop for HardwareHmacSha256 {
+    fn drop(&mut self) {
+        self.outer_key_pad.zeroize();
+    }
+}
+
 impl TlsHmac for HardwareHmacSha256 {
     type OutputSize = U32;
 
@@ -36,8 +45,7 @@ impl TlsHmac for HardwareHmacSha256 {
         if key.len() > SHA256_BLOCK_SIZE {
             // Hash the key down to 32 bytes.
             let digest = with_hash(|hash| {
-                let ctx = hash.start(Algorithm::SHA256, DataType::Width8, None);
-                let mut ctx = ctx;
+                let mut ctx = hash.start(Algorithm::SHA256, DataType::Width8, None);
                 hash.update_blocking(&mut ctx, key);
                 let mut buf = [0u8; 32];
                 hash.finish_blocking(ctx, &mut buf);
@@ -51,9 +59,9 @@ impl TlsHmac for HardwareHmacSha256 {
         // Compute ipad and opad key blocks.
         let mut inner_key_pad = [0u8; SHA256_BLOCK_SIZE];
         let mut outer_key_pad = [0u8; SHA256_BLOCK_SIZE];
-        for i in 0..SHA256_BLOCK_SIZE {
-            inner_key_pad[i] = key_block[i] ^ 0x36;
-            outer_key_pad[i] = key_block[i] ^ 0x5C;
+        for ((inner, outer), &k) in inner_key_pad.iter_mut().zip(outer_key_pad.iter_mut()).zip(key_block.iter()) {
+            *inner = k ^ 0x36;
+            *outer = k ^ 0x5C;
         }
 
         // Start the inner hash and feed the ipad-XORed key.
@@ -75,36 +83,43 @@ impl TlsHmac for HardwareHmacSha256 {
         });
     }
 
-    fn finalize(self) -> GenericArray<u8, U32> {
+    fn finalize(mut self) -> GenericArray<u8, U32> {
+        // Take ownership of fields before drop runs.
+        // Replace inner_ctx with a dummy context that won't be used.
+        let inner_ctx = with_hash(|hash| {
+            let dummy = hash.start(Algorithm::SHA256, DataType::Width8, None);
+            mem::replace(&mut self.inner_ctx, dummy)
+        });
+        let mut outer_key_pad = [0u8; SHA256_BLOCK_SIZE];
+        outer_key_pad.copy_from_slice(&self.outer_key_pad);
+        // Zeroize early since we copied it out.
+        self.outer_key_pad.zeroize();
+
         // Finish the inner hash: H(K' XOR ipad || message)
         let mut inner_digest = [0u8; 32];
         with_hash(|hash| {
-            hash.finish_blocking(self.inner_ctx, &mut inner_digest);
+            hash.finish_blocking(inner_ctx, &mut inner_digest);
         });
 
         // Compute the outer hash: H(K' XOR opad || inner_digest)
         let mut result = [0u8; 32];
         with_hash(|hash| {
             let mut ctx = hash.start(Algorithm::SHA256, DataType::Width8, None);
-            hash.update_blocking(&mut ctx, &self.outer_key_pad);
+            hash.update_blocking(&mut ctx, &outer_key_pad);
             hash.update_blocking(&mut ctx, &inner_digest);
             hash.finish_blocking(ctx, &mut result);
         });
 
+        outer_key_pad.zeroize();
         GenericArray::clone_from_slice(&result)
     }
 
     fn verify(self, tag: &GenericArray<u8, U32>) -> Result<(), TlsError> {
         let computed = self.finalize();
-        // Constant-time comparison.
-        let mut diff = 0u8;
-        for (a, b) in computed.iter().zip(tag.iter()) {
-            diff |= a ^ b;
-        }
-        if diff != 0 {
-            Err(TlsError::CryptoError)
-        } else {
+        if computed.ct_eq(tag).into() {
             Ok(())
+        } else {
+            Err(TlsError::CryptoError)
         }
     }
 }

@@ -11,10 +11,11 @@ categories = ["embedded", "no-std", "cryptography"]
 
 [dependencies]
 embassy-stm32 = { version = "0.6", features = ["stm32h755zi-cm7"] }
-embedded-tls = { path = "../embedded-tls-hw", default-features = false }
+embedded-tls = { git = "https://github.com/fishloa/embedded-tls.git", branch = "hw-crypto-extensibility", default-features = false }
 critical-section = "1"
-digest = { version = "0.10", default-features = false }
 generic-array = { version = "0.14", default-features = false }
+subtle = { version = "2", default-features = false }
+zeroize = { version = "1", default-features = false }
 typenum = { version = "1", default-features = false }
 sha2 = { version = "0.10", default-features = false }
 defmt = { version = "0.3", optional = true }

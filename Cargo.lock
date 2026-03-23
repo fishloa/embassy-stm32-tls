@@ -550,7 +550,6 @@ dependencies = [
  "critical-section",
  "defmt 0.3.100",
  "defmt-rtt",
- "digest",
  "embassy-executor",
  "embassy-net",
  "embassy-stm32",
@@ -561,7 +560,9 @@ dependencies = [
  "panic-probe",
  "sha2",
  "static_cell",
+ "subtle",
  "typenum",
+ "zeroize",
 ]
 
 [[package]]

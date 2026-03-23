@@ -1,10 +1,9 @@
 //! Hardware SHA-256 hash using the STM32H7 HASH peripheral.
 
+use embassy_stm32::hash::{Algorithm, Context, DataType};
 use embedded_tls::TlsHash;
 use generic_array::GenericArray;
 use typenum::U32;
-
-use embassy_stm32::hash::{Algorithm, Context, DataType};
 
 use super::with_hash;
 
